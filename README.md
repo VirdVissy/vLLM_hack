@@ -75,21 +75,27 @@ Both models are served via vLLM's OpenAI-compatible API on different ports; the 
 ## Quick start
 
 ```bash
-# 1. quantize the base model
+# 1. quantize the base model (try any recipe in recipes/)
 python scripts/quantize.py \
     --model Qwen/Qwen2.5-14B-Instruct \
     --recipe recipes/w4a16_gptq.yaml \
     --output ./models/qwen2.5-14b-w4a16
 
-# 2. serve both models (two GPUs, or one GPU sequentially)
-vllm serve Qwen/Qwen2.5-14B-Instruct --port 8000
-vllm serve ./models/qwen2.5-14b-w4a16 --port 8001 \
-    --quantization compressed-tensors
+# 2. serve both models with optimization flags pre-baked
+./scripts/serve_base.sh    # FP16, port 8000
+./scripts/serve_quant.sh   # INT4, port 8001
+# optional extra KV-cache compression:
+# QUANT_KV_CACHE_DTYPE=fp8 ./scripts/serve_quant.sh
 
-# 3. run the offline benchmark suite (populates the dashboard)
-python -m gauntlet.bench --tasks mmlu,gsm8k,humaneval
+# 3. measure everything
+python -m gauntlet.bench.run         --tasks mmlu,gsm8k,humaneval   # accuracy
+python -m gauntlet.bench.throughput  --concurrency 8 --requests 32  # speed + latency
+python -m gauntlet.bench.memory      --base-pid <pid> --quant-pid <pid>
 
-# 4. launch the arena
+# 4. one-glance summary table
+python scripts/summarize.py
+
+# 5. launch the arena
 python -m gauntlet.app
 ```
 
@@ -98,34 +104,63 @@ python -m gauntlet.app
 ```
 gauntlet/
   app.py              # Gradio UI: Adventure + Break It + Dashboard tabs
-  clients.py          # two OpenAI clients pointed at vLLM :8000 / :8001
+  clients.py          # two OpenAI clients (vLLM :8000 / :8001) + parallel_stream
   adventure/
     dm.py             # dungeon-master prompt + game state
-    consistency.py    # context-recall tracker
+    consistency.py    # inventory + death tracker, contradiction detection
   break_it/
-    challenges.py     # prompt bank by category
-    scoring.py        # auto-graders (JSON, math, schema, etc.)
+    challenges.py     # 11 challenges across 7 categories
+    scoring.py        # auto-graders (JSON, math, schema, multilingual, etc.)
   bench/
-    run.py            # lm-eval-harness wrapper
-    plots.py          # Pareto frontier, radar, cost charts
+    run.py            # lm-eval-harness wrapper (MMLU/GSM8K/HumanEval)
+    throughput.py     # async load test (TTFT, ITL, throughput)
+    memory.py         # nvidia-smi snapshot per process
+    plots.py          # Pareto, radar, cost charts
 scripts/
-  quantize.py         # LLM Compressor recipe runner
+  quantize.py         # LLM Compressor one-shot runner
+  serve_base.sh       # vLLM launch: base FP16 + optimization flags
+  serve_quant.sh      # vLLM launch: quantized + extra flags (FP8 KV cache)
+  summarize.py        # prints the headline "quantization tax" table
 recipes/
-  w4a16_gptq.yaml     # quantization config
+  w4a16_gptq.yaml     # 4-bit weights, 16-bit acts, GPTQ
+  w8a8_int8.yaml      # 8-bit weights + acts, SmoothQuant + GPTQ
+  fp8_dynamic.yaml    # FP8 weights + acts (H100 native)
 results/
-  bench.json          # benchmark output consumed by the dashboard
+  bench.json                # accuracy summary
+  throughput_detail.json    # latency + throughput
+  memory.json               # GPU memory per process
 ```
 
-## Quantization documentation
+## Quantization
 
-What we did, why, and how to reproduce it:
+What we tried and why. Each recipe is a one-line swap in `scripts/quantize.py`:
 
-- **Method:** GPTQ W4A16 via LLM Compressor.
-- **Calibration data:** 512 samples from `open-platypus` (mixed reasoning + instruction-following).
-- **Why W4A16 over W8A8 or W4A8:** target was max memory savings while keeping the sm89/sm90 fast paths; W4A16 hits the throughput sweet spot on a single H100 / 4090-class GPU.
-- **Memory:** ~28 GB → ~8 GB.
-- **Configs tested:** see `recipes/`. We benchmarked W8A8, W4A16-GPTQ, and W4A16-AWQ — GPTQ won the gauntlet.
-- **Reproducibility:** `scripts/quantize.py` is deterministic given the recipe file and a fixed calibration seed.
+| Recipe                | Bits (W/A) | Method            | Best for                                   |
+| --------------------- | ---------- | ----------------- | ------------------------------------------ |
+| `w4a16_gptq.yaml`     | 4 / 16     | GPTQ              | Max memory savings; T4/4090-class GPUs     |
+| `w8a8_int8.yaml`      | 8 / 8      | SmoothQuant + GPTQ| Better math/reasoning preservation         |
+| `fp8_dynamic.yaml`    | 8 / 8 (FP) | FP8 dynamic       | H100 / Ada Lovelace — native fast path     |
+
+- **Calibration data:** 512 samples from `open_platypus` (mixed reasoning + instruction).
+- **Memory:** Qwen 2.5 14B baseline ~28 GB → W4A16 ~8 GB → W8A8 ~14 GB → FP8 ~14 GB (KV cache shrinks separately, see below).
+- **Reproducibility:** `scripts/quantize.py` is deterministic given the recipe + calibration seed.
+- **The Gauntlet runs all three** so the demo has data to argue *which* quantization actually pays off — not just "quant beats base."
+
+## Serving optimization
+
+Quantization is half the story; vLLM flags are the other half. `scripts/serve_*.sh` apply both layers consistently across the comparison:
+
+| Flag                              | Purpose                                                  |
+| --------------------------------- | -------------------------------------------------------- |
+| `--enable-prefix-caching`         | Reuse KV cache across requests sharing a prefix. Big win for the Adventure system prompt that repeats every turn. |
+| `--enable-chunked-prefill`        | Interleave prefill + decode → better TTFT under load.    |
+| `--max-num-seqs 64`               | Cap concurrent sequences for predictable tail latency.   |
+| `--gpu-memory-utilization 0.9`    | Headroom for KV cache growth.                            |
+| `--max-model-len 4096`            | Tractable seq length on a single GPU.                    |
+| `--quantization compressed-tensors` *(quant only)* | Tells vLLM the weights are LLM-Compressor format. |
+| `QUANT_KV_CACHE_DTYPE=fp8` *(optional quant serving-stack test)* | Shrinks the KV cache too, on top of weight quantization; leave unset for a cleaner weight-only comparison. |
+
+Both servers run with identical flags except `--quantization compressed-tensors` by default, so the base comparison isolates weight quantization. If you enable FP8 KV cache for the quant server only, report it as an additional serving-stack optimization rather than pure weight-quantization gain.
 
 ## What we measure
 

@@ -21,6 +21,8 @@ def radar_chart(summary: dict) -> go.Figure:
         return _placeholder("No benchmark results yet — run `python -m gauntlet.bench.run`")
 
     tasks = sorted({t for model in results.values() for t in model.keys()})
+    if not tasks:
+        return _placeholder("No benchmark task scores found in results/bench.json")
     fig = go.Figure()
     for model_label, scores in results.items():
         values = [(scores.get(t) or 0.0) for t in tasks]

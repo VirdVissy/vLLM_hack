@@ -1,0 +1,21 @@
+# FP8 dynamic — weights and activations in FP8 (E4M3) with dynamic per-token
+# activation scaling. Native fast path on H100 / Ada Lovelace tensor cores.
+# Often the best speed/accuracy tradeoff when the hardware supports it.
+quant_stage:
+  quant_modifiers:
+    QuantizationModifier:
+      ignore: ["lm_head"]
+      config_groups:
+        group_0:
+          weights:
+            num_bits: 8
+            type: float
+            symmetric: true
+            strategy: channel
+          input_activations:
+            num_bits: 8
+            type: float
+            symmetric: true
+            strategy: token
+            dynamic: true
+          targets: ["Linear"]

@@ -26,6 +26,7 @@ from gauntlet.break_it.scoring import grade
 from gauntlet.clients import make_clients, parallel_stream
 
 BASE, QUANT = make_clients()
+CHALLENGES_BY_ID = {c.id: c for c in CHALLENGES}
 
 
 # ---------------------------------------------------------------------------
@@ -50,12 +51,13 @@ def _format_metrics(state: dict) -> str:
         last = history[-1]
         avg_tps = sum(m["tokens_per_sec"] for m in history) / len(history)
         ttft = f"{last['ttft']:.2f}s" if last.get("ttft") is not None else "—"
+        tracker_summary = tracker.summary()
         return (
             f"**{label}** — last: {last['tokens']} tok / {last['elapsed']:.2f}s "
             f"({last['tokens_per_sec']:.1f} tok/s, TTFT {ttft}) · "
             f"avg {avg_tps:.1f} tok/s · "
             f"inventory: {len(tracker.inventory)} · "
-            f"contradictions: {tracker.summary()['total_contradictions']}"
+            f"contradictions: {tracker_summary['total_contradictions']}"
         )
 
     return "\n\n".join(
@@ -76,6 +78,7 @@ def adventure_step(player_action: str, state: dict):
     state["quant_messages"] = append_player(state["quant_messages"], player_action)
 
     last_base, last_quant = "", ""
+    base_state, quant_state = {}, {}
     for base_state, quant_state in parallel_stream(
         BASE,
         QUANT,
@@ -125,7 +128,7 @@ def _resolve_prompt(challenge) -> str:
 
 
 def run_challenge(challenge_id: str, state: dict):
-    challenge = next(c for c in CHALLENGES if c.id == challenge_id)
+    challenge = CHALLENGES_BY_ID[challenge_id]
     prompt = _resolve_prompt(challenge)
     messages = [{"role": "user", "content": prompt}]
 

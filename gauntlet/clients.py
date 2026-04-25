@@ -13,7 +13,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Any, Iterator
 
 from openai import OpenAI
 
@@ -24,6 +24,10 @@ class ModelClient:
     label: str
     model_id: str
     client: OpenAI
+
+
+def _include_usage() -> bool:
+    return os.getenv("STREAM_INCLUDE_USAGE", "1").lower() not in {"0", "false", "no"}
 
 
 def make_clients() -> tuple[ModelClient, ModelClient]:
@@ -49,19 +53,32 @@ def make_clients() -> tuple[ModelClient, ModelClient]:
 
 
 def stream_chat(mc: ModelClient, messages: list[dict], **kwargs) -> Iterator[dict]:
-    """Stream a chat completion. Yields delta events and a final done event with metrics."""
+    """Stream a chat completion and yield deltas plus a final metrics event."""
     start = time.perf_counter()
     first_token_at: float | None = None
-    tokens = 0
-    accumulated = ""
+    chunks = 0
+    completion_tokens: int | None = None
 
-    stream = mc.client.chat.completions.create(
-        model=mc.model_id,
-        messages=messages,
-        stream=True,
+    request_kwargs: dict[str, Any] = {
+        "model": mc.model_id,
+        "messages": messages,
+        "stream": True,
         **kwargs,
-    )
+    }
+    if _include_usage():
+        request_kwargs["stream_options"] = {"include_usage": True}
+
+    try:
+        stream = mc.client.chat.completions.create(**request_kwargs)
+    except Exception:
+        if "stream_options" not in request_kwargs:
+            raise
+        request_kwargs.pop("stream_options", None)
+        stream = mc.client.chat.completions.create(**request_kwargs)
     for chunk in stream:
+        usage = getattr(chunk, "usage", None)
+        if usage is not None:
+            completion_tokens = getattr(usage, "completion_tokens", None)
         if not chunk.choices:
             continue
         delta = chunk.choices[0].delta
@@ -70,22 +87,23 @@ def stream_chat(mc: ModelClient, messages: list[dict], **kwargs) -> Iterator[dic
             continue
         if first_token_at is None:
             first_token_at = time.perf_counter()
-        tokens += 1
-        accumulated += content
+        chunks += 1
         yield {
             "type": "delta",
             "content": content,
-            "accumulated": accumulated,
-            "tokens": tokens,
+            "tokens": completion_tokens or chunks,
+            "chunks": chunks,
             "elapsed": time.perf_counter() - start,
             "ttft": (first_token_at - start) if first_token_at else None,
         }
 
     elapsed = time.perf_counter() - start
+    tokens = completion_tokens or chunks
     yield {
         "type": "done",
-        "accumulated": accumulated,
         "tokens": tokens,
+        "chunks": chunks,
+        "token_source": "usage" if completion_tokens is not None else "stream_chunks",
         "elapsed": elapsed,
         "ttft": (first_token_at - start) if first_token_at else None,
         "tokens_per_sec": (tokens / elapsed) if elapsed > 0 else 0.0,
@@ -119,10 +137,19 @@ def parallel_stream(
     threading.Thread(target=worker, args=("base", base), daemon=True).start()
     threading.Thread(target=worker, args=("quant", quant), daemon=True).start()
 
-    state = {
-        "base": {"text": "", "tokens": 0, "elapsed": 0.0, "ttft": None, "done": None, "tokens_per_sec": None, "error": None},
-        "quant": {"text": "", "tokens": 0, "elapsed": 0.0, "ttft": None, "done": None, "tokens_per_sec": None, "error": None},
-    }
+    def initial_state() -> dict:
+        return {
+            "text": "",
+            "tokens": 0,
+            "chunks": 0,
+            "elapsed": 0.0,
+            "ttft": None,
+            "done": None,
+            "tokens_per_sec": None,
+            "error": None,
+        }
+
+    state = {"base": initial_state(), "quant": initial_state()}
     finished = {"base": False, "quant": False}
 
     while not (finished["base"] and finished["quant"]):
@@ -132,13 +159,14 @@ def parallel_stream(
             continue
         s = state[label]
         if ev["type"] == "delta":
-            s["text"] = ev["accumulated"]
+            s["text"] += ev["content"]
             s["tokens"] = ev["tokens"]
+            s["chunks"] = ev["chunks"]
             s["elapsed"] = ev["elapsed"]
             s["ttft"] = ev["ttft"]
         elif ev["type"] == "done":
-            s["text"] = ev["accumulated"]
             s["tokens"] = ev["tokens"]
+            s["chunks"] = ev["chunks"]
             s["elapsed"] = ev["elapsed"]
             s["ttft"] = ev["ttft"]
             s["tokens_per_sec"] = ev["tokens_per_sec"]
